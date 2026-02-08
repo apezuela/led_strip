@@ -1,3 +1,0 @@
-Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/anto/.espressif/tools/python/v5.5.2/venv/bin/python -DESP_PLATFORM=1 -DSDKCONFIG=sdkconfig -DCCACHE_ENABLE=0 /home/anto/espressif-ide-workspace/led_strip
-info: Trying to set symbol ESPTOOLPY_FLASHSIZE_2MB to n, but it is currently selected by choice ESPTOOLPY_FLASHSIZE. For setting it to n, set another choice symbol to y instead.
-info: Trying to set symbol PARTITION_TABLE_SINGLE_APP to n, but it is currently selected by choice PARTITION_TABLE_TYPE. For setting it to n, set another choice symbol to y instead.

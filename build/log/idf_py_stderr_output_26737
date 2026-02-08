@@ -1,1 +1,0 @@
-Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/anto/.espressif/tools/python/v5.5.2/venv/bin/python -DESP_PLATFORM=1 -DSDKCONFIG=sdkconfig -DCCACHE_ENABLE=0 /home/anto/espressif-ide-workspace/led_strip
