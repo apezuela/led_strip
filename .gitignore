@@ -17,6 +17,8 @@ sdkconfig.old
 # ESP-IDF config
 sdkconfig
 sdkconfig.old
+skdconfig.*
+
 
 # Logs
 *.log
