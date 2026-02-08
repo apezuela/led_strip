@@ -18,10 +18,16 @@ sdkconfig.old
 sdkconfig
 sdkconfig.old
 skdconfig.*
-sdkcofnig.defaults.*
+sdkconfig.defaults.*
 *.py
 
 
 
 # Logs
 *.log
+
+# Archivos Python y CSV
+*.py
+*.pyc
+*.csv
+__pycache__/
