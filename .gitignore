@@ -1,0 +1,13 @@
+# ESP-IDF build
+#build/
+server_certs/
+managed_components/
+dependencies/
+
+
+# ESP-IDF config
+sdkconfig
+sdkconfig.old
+
+# Logs
+*.log

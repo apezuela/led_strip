@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/home/anto/espressif-ide-workspace/led_strip/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}
