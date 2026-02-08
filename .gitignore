@@ -18,6 +18,9 @@ sdkconfig.old
 sdkconfig
 sdkconfig.old
 skdconfig.*
+sdkcofnig.defaults.*
+*.py
+
 
 
 # Logs
