@@ -1,877 +1,850 @@
-
-/* 
- * ============================================================================
- * ESP32 LED STRIP CON ACTUALIZACIONES OTA (Over-The-Air)
- * ============================================================================
+/**
+ * @file main.c
+ * @brief Aplicación principal - Control de LED Strip con actualización OTA
  * 
- * Descripción:
- * Este programa controla una tira de LEDs addressable (WS2812B/NeoPixel) y
- * permite actualizaciones de firmware remotas mediante OTA sobre HTTPS.
+ * DESCRIPCIÓN GENERAL:
+ * ===================
+ * Este programa controla una tira de LEDs RGB addressable (WS2812B) y
+ * permite actualizaciones remotas de firmware mediante OTA (Over-The-Air)
+ * sobre conexión WiFi segura (HTTPS).
  * 
- * Características principales:
- * - Control de 5 LEDs RGB con diferentes colores
- * - Conexión WiFi automática con reintentos
- * - Actualización OTA segura con validación de firmware
- * - Indicadores visuales LED para cada estado del sistema
- * - Soporte para rollback en caso de firmware defectuoso
+ * ARQUITECTURA DEL SISTEMA:
+ * ========================
+ * El código está organizado en módulos independientes:
  * 
- * Licencia: Public Domain / CC0
- * ============================================================================
+ * - main.c:          Punto de entrada, inicialización y orquestación
+ * - led_control:     Gestión de la tira LED y efectos visuales
+ * - wifi_manager:    Conexión y mantenimiento de WiFi
+ * - ota_manager:     Descarga e instalación de actualizaciones OTA
+ * 
+ * FLUJO DE EJECUCIÓN:
+ * ==================
+ * 1. Arranque del sistema ESP32
+ * 2. app_main() se ejecuta automáticamente
+ * 3. Inicialización secuencial de subsistemas
+ * 4. Creación de tareas FreeRTOS
+ * 5. app_main() retorna
+ * 6. El scheduler de FreeRTOS toma control
+ * 7. Las tareas se ejecutan concurrentemente según prioridades
+ * 
+ * CARACTERÍSTICAS:
+ * ===============
+ * ✓ Control de 5 LEDs RGB con retroalimentación visual de estados
+ * ✓ Conexión WiFi automática con reintentos
+ * ✓ Actualización OTA segura con validación de firmware
+ * ✓ Soporte para rollback automático en caso de firmware defectuoso
+ * ✓ Sistema operativo en tiempo real (FreeRTOS)
+ * 
+ * HARDWARE REQUERIDO:
+ * ==================
+ * - ESP32 (cualquier modelo)
+ * - Tira LED WS2812B/NeoPixel (5 LEDs)
+ * - Conexión WiFi disponible
+ * - Alimentación adecuada para LEDs
+ * 
+ * CONFIGURACIÓN:
+ * =============
+ * Antes de compilar, configurar mediante menuconfig:
+ * - WiFi SSID y Password
+ * - GPIO para la tira LED
+ * - URL del servidor OTA (opcional)
+ * 
+ * @author Tu Nombre
+ * @version 1.0.0
+ * @date 2025
+ * @license Public Domain / CC0
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
+// ============================================================================
+// INCLUDES DEL SISTEMA
+// ============================================================================
 
-// ==================== INCLUDES DE FREERTOS ====================
+#include <stdio.h>                  // Funciones estándar de C (printf, etc)
+
+// --- FreeRTOS ---
 #include "freertos/FreeRTOS.h"      // Sistema operativo en tiempo real
-#include "freertos/task.h"          // Gestión de tareas
-#include "freertos/event_groups.h"  // Sincronización mediante bits de eventos
+#include "freertos/task.h"          // Gestión de tareas concurrentes
 
-// ==================== INCLUDES DE ESP-IDF ====================
-#include "esp_system.h"             // Funciones del sistema ESP32
-#include "esp_event.h"              // Sistema de eventos
-#include "esp_log.h"                // Sistema de logging
-#include "esp_check.h"              // Macros de verificación de errores
-#include "esp_http_client.h"        // Cliente HTTP/HTTPS
-#include "nvs.h"                    // Non-Volatile Storage (almacenamiento flash)
-#include "nvs_flash.h"              // Inicialización de NVS
-#include "esp_netif.h"              // Interfaz de red
+// --- ESP-IDF Core ---
+#include "esp_system.h"             // Funciones del sistema ESP32 (reinicio, etc)
+#include "esp_log.h"                // Sistema de logging con niveles (INFO, ERROR, etc)
+#include "nvs_flash.h"              // Almacenamiento no volátil (flash)
 
-// ==================== INCLUDES DE OTA ====================
+// --- OTA ---
 #include "esp_ota_ops.h"            // Operaciones de actualización OTA
-#include "esp_https_ota.h"          // OTA sobre HTTPS
-
-// ==================== INCLUDES DE WIFI ====================
-#include "esp_wifi.h"               // API de WiFi
-
-// ==================== INCLUDES DE PERIFÉRICOS ====================
-#include "driver/gpio.h"            // Control de pines GPIO
-#include "led_strip.h"              // Driver para tiras LED addressable
-#include "sdkconfig.h"              // Configuración del proyecto
 
 // ============================================================================
-// CONFIGURACIÓN DE WIFI
+// INCLUDES DE MÓDULOS PROPIOS
 // ============================================================================
-#define WIFI_SSID  CONFIG_WIFI_SSID  //  Nombre de la red WiFi
-#define WIFI_PASS  CONFIG_WIFI_PASS  //  Contraseña de la red WiFi
-#define MAXIMUM_RETRY  5            // Número máximo de intentos de reconexión
 
-// ============================================================================
-// CONFIGURACIÓN DE OTA
-// ============================================================================
-// URL donde se encuentra el nuevo firmware (.bin)
-// Puede configurarse en menuconfig o directamente aquí
-#ifndef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL
-#define FIRMWARE_UPGRADE_URL "https://tu-servidor.com/firmware.bin"
-#else
-#define FIRMWARE_UPGRADE_URL CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL
-#endif
+#include "led_control.h"            // Control de tira LED
+#include "wifi_manager.h"           // Gestión de WiFi
+#include "ota_manager.h"            // Gestión de actualizaciones OTA
 
 // ============================================================================
-// CONFIGURACIÓN DE LEDS
-// ============================================================================
-#define BLINK_GPIO CONFIG_BLINK_GPIO  // Pin GPIO para la tira LED (configurado en menuconfig)
-#define NUM_LEDS 5                    // Cantidad de LEDs en la tira
-
-// ============================================================================
-// DEFINICIÓN DE COLORES RGB
-// ============================================================================
-// Los valores están en formato GRB (Green-Red-Blue) para WS2812B
-// AZUL - Indica proceso OTA en progreso
-#define BLUE_R  184
-#define BLUE_G  179
-#define BLUE_B  44
-
-// ROJO - Indica error o fallo en la operación
-#define RED_R   184
-#define RED_G   44
-#define RED_B   181
-
-// VERDE - Indica éxito en la operación
-#define GREEN_R  0
-#define GREEN_G  245
-#define GREEN_B  210
-
-// NARANJA - Indica reconexión WiFi
-#define ORANGE_R  0
-#define ORANGE_G  245
-#define ORANGE_B  210
-
-// ============================================================================
-// VARIABLES GLOBALES
-// ============================================================================
-static const char *TAG = "LED_OTA_APP";  // Tag para mensajes de log
-
-// Certificado CA del servidor HTTPS para verificar la conexión segura
-// Estos símbolos son generados por el sistema de build desde el archivo ca_cert.pem
-extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-
-// Handle (manejador) de la tira LED
-static led_strip_handle_t led_strip;
-
-// Event group para sincronizar la conexión WiFi
-static EventGroupHandle_t s_wifi_event_group;
-
-// Bit que indica que WiFi está conectado
-static const int WIFI_CONNECTED_BIT = BIT0;
-
-// Contador de reintentos de conexión WiFi
-static int s_retry_num = 0;
-
-// Contador global para el parpadeo durante escritura flash en OTA
-static int ota_flash_write_count = 0;
-
-
-// ============================================================================
-// FUNCIONES DE CONTROL DE LEDS
+// DEFINICIONES Y CONFIGURACIÓN
 // ============================================================================
 
 /**
- * @brief Establece el mismo color en todos los LEDs de la tira
+ * @brief Tag para identificar mensajes de log del módulo principal
  * 
- * Esta función configura todos los LEDs al color especificado y
- * actualiza inmediatamente la tira para mostrar el cambio.
- * 
- * @param r Componente rojo (0-255)
- * @param g Componente verde (0-255)
- * @param b Componente azul (0-255)
- * 
- * @note Los LEDs WS2812B usan formato GRB internamente, pero esta
- *       función acepta RGB y el driver realiza la conversión
+ * Se usa en todas las llamadas ESP_LOGx() para filtrar mensajes.
+ * Ejemplo: ESP_LOGI(TAG, "Sistema iniciado");
  */
-static void set_all_leds(uint8_t r, uint8_t g, uint8_t b)
-{
-    // Iterar sobre todos los LEDs de la tira
-    for (int i = 0; i < NUM_LEDS; i++) {
-        led_strip_set_pixel(led_strip, i, r, g, b);
-    }
-    // Enviar los datos a la tira LED para que se muestren los cambios
-    led_strip_refresh(led_strip);
-}
-
-/**
- * @brief Secuencia de parpadeo demostrativa de los LEDs
- * 
- * Ciclo de 3 colores:
- * - ROJO durante 5 segundos
- * - AZUL durante 5 segundos
- * - VERDE durante 5 segundos
- * 
- * @note Esta función es bloqueante (usa vTaskDelay)
- */
-static void blink_led(void)
-{
-    // ROJO durante 5 segundos
-    set_all_leds(RED_R, RED_G, RED_B);
-    vTaskDelay(pdMS_TO_TICKS(5000));  // pdMS_TO_TICKS convierte ms a ticks del sistema
-
-    // AZUL durante 5 segundos
-    set_all_leds(BLUE_R, BLUE_G, BLUE_B);
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    // VERDE durante 5 segundos
-    set_all_leds(GREEN_R, GREEN_G, GREEN_B);
-    vTaskDelay(pdMS_TO_TICKS(5000));
-}
-
-/**
- * @brief Configura e inicializa la tira LED addressable
- * 
- * Inicializa el driver RMT (Remote Control) para controlar la tira LED.
- * El protocolo RMT permite generar las señales de timing precisas que
- * requieren los LEDs WS2812B.
- * 
- * @note Esta función debe llamarse antes de usar cualquier función de LED
- */
-static void configure_led(void)
-{
-    ESP_LOGI(TAG, "Configurando LED addressable en GPIO %d", BLINK_GPIO);
-    
-    // Configuración de la tira LED
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = BLINK_GPIO,   // Pin GPIO a utilizar
-        .max_leds = NUM_LEDS,           // Número máximo de LEDs
-    };
-
-    // Configuración del periférico RMT
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000,  // 10MHz - Resolución del timer
-        .flags.with_dma = false,            // No usar DMA (para tiras pequeñas no es necesario)
-    };
-    
-    // Crear el dispositivo LED con las configuraciones
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    
-    // Limpiar (apagar) todos los LEDs al inicio
-    led_strip_clear(led_strip);
-}
-
-/**
- * @brief Tarea FreeRTOS que ejecuta la secuencia de parpadeo LED
- * 
- * Esta tarea se ejecuta continuamente mostrando la secuencia de colores.
- * Es útil para demostración o testing, pero normalmente se comenta en
- * producción para que los LEDs solo muestren estados del sistema.
- * 
- * @param pvParameter Parámetro de la tarea (no utilizado)
- */
-void led_strip_task(void *pvParameter)
-{
-    // Configurar los LEDs antes de entrar al loop
-    //configure_led();
-
-    // Loop infinito de la tarea
-    while (1) {
-        blink_led();  // Ejecutar secuencia de parpadeo
-    }
-}
-
-
+static const char *TAG = "MAIN";
 
 // ============================================================================
-// FUNCIONES DE WIFI
+// FUNCIÓN PRINCIPAL DE LA APLICACIÓN
 // ============================================================================
 
 /**
- * @brief Manejador de eventos WiFi e IP
+ * @brief Punto de entrada principal de la aplicación ESP32
  * 
- * Esta función callback se ejecuta cuando ocurren eventos relacionados
- * con WiFi o asignación de IP. Gestiona:
- * - Inicio de conexión WiFi
- * - Reintentos en caso de desconexión
- * - Indicación visual mediante LEDs del estado de conexión
- * - Obtención de dirección IP
+ * PROPÓSITO:
+ * ==========
+ * Esta función se ejecuta automáticamente cuando el ESP32 arranca.
+ * Su responsabilidad es inicializar todos los subsistemas del proyecto
+ * en el orden correcto y crear las tareas que se ejecutarán continuamente.
  * 
- * @param arg Argumento personalizado (no utilizado)
- * @param event_base Base del evento (WIFI_EVENT o IP_EVENT)
- * @param event_id ID específico del evento
- * @param event_data Datos adicionales del evento
- */
-static void event_handler(void* arg, esp_event_base_t event_base,
-                         int32_t event_id, void* event_data)
-{
-    // ===== EVENTOS DE WIFI =====
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        // WiFi iniciado, intentar conectar
-        esp_wifi_connect();
-        ESP_LOGI(TAG, "Iniciando conexión WiFi...");
-        
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        // WiFi desconectado, intentar reconectar
-        if (s_retry_num < MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Reintento %d de conexión WiFi", s_retry_num);
-            // LED naranja durante reconexión
-            set_all_leds(ORANGE_R, ORANGE_G, ORANGE_B);
-        } else {
-            // Se agotaron los reintentos
-            ESP_LOGE(TAG, "Fallo al conectar a WiFi");
-            // LED rojo fijo si falla completamente
-            set_all_leds(RED_R, RED_G, RED_B);
-        }
-        
-    // ===== EVENTOS DE IP =====
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        // Se obtuvo dirección IP - conexión exitosa
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "IP obtenida: " IPSTR, IP2STR(&event->ip_info.ip));
-        
-        // Resetear contador de reintentos
-        s_retry_num = 0;
-        
-        // Señalar que WiFi está conectado mediante el event group
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        
-        // LED verde al conectar exitosamente
-        set_all_leds(GREEN_R, GREEN_G, GREEN_B);
-        vTaskDelay(pdMS_TO_TICKS(2000));  // Mostrar verde 2 segundos
-    }
-}
-
-/**
- * @brief Inicializa WiFi en modo Station (cliente)
+ * FASES DE INICIALIZACIÓN:
+ * ========================
  * 
- * Configura y arranca el WiFi para conectarse a un Access Point.
- * Esta función:
- * 1. Crea el event group para sincronización
- * 2. Inicializa la pila TCP/IP
- * 3. Configura los parámetros WiFi (SSID, password)
- * 4. Registra los manejadores de eventos
- * 5. Inicia la conexión
- * 6. Espera hasta obtener IP
- * 7. Desactiva el ahorro de energía para mejor rendimiento OTA
+ * FASE 1: INFORMACIÓN DEL SISTEMA
+ *   - Muestra versión del firmware actual
+ *   - Muestra fecha y hora de compilación
+ *   - Útil para debugging y trazabilidad
  * 
- * @note Esta función es bloqueante hasta que se obtiene IP o falla la conexión
- */
-static void wifi_init_sta(void)
-{
-    // Crear event group para señalización entre tareas
-    s_wifi_event_group = xEventGroupCreate();
-
-    // Inicializar la pila TCP/IP
-    ESP_ERROR_CHECK(esp_netif_init());
-    
-    // Crear el loop de eventos por defecto
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    // Crear interfaz de red WiFi en modo estación
-    esp_netif_create_default_wifi_sta();
-
-    // Configuración WiFi con valores por defecto
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    // Variables para almacenar las instancias de los manejadores de eventos
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    
-    // Registrar manejador para TODOS los eventos WiFi
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    
-    // Registrar manejador específico para obtención de IP
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    // Configuración de credenciales WiFi
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,                      // Nombre de la red
-            .password = WIFI_PASS,                  // Contraseña
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK, // Modo de autenticación mínimo
-        },
-    };
-    
-    // Configurar WiFi en modo estación (cliente)
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    
-    // Aplicar la configuración
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    
-    // Iniciar WiFi
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Inicialización WiFi completada.");
-    
-    // Esperar de forma bloqueante hasta que se conecte WiFi
-    // portMAX_DELAY = esperar indefinidamente
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT,
-                                           pdFALSE,  // No limpiar el bit al leer
-                                           pdFALSE,  // No esperar todos los bits
-                                           portMAX_DELAY);
-
-    // Verificar si se obtuvo conexión
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Conectado a WiFi SSID:%s", WIFI_SSID);
-    } else {
-        ESP_LOGE(TAG, "No se pudo conectar a WiFi");
-    }
-
-    // Desactivar ahorro de energía WiFi para mejor rendimiento durante OTA
-    // Esto previene desconexiones durante la descarga del firmware
-    esp_wifi_set_ps(WIFI_PS_NONE);
-}
-// ============================================================================
-// FUNCIONES OTA (Over-The-Air Update)
-// ============================================================================
-
-/**
- * @brief Manejador de eventos del proceso OTA
+ * FASE 2: INICIALIZACIÓN NVS
+ *   - Prepara el sistema de almacenamiento flash
+ *   - Necesario para: WiFi, configuración, datos persistentes
+ *   - Maneja errores comunes (sin espacio, nueva versión)
  * 
- * Esta función callback se ejecuta en diferentes etapas del proceso OTA
- * y proporciona retroalimentación visual mediante los LEDs.
+ * FASE 3: INICIALIZACIÓN DE PERIFÉRICOS
+ *   - LEDs: Debe ser PRIMERO para dar feedback visual
+ *   - WiFi: Conexión a red (bloqueante)
+ *   - OTA: Registro de manejadores de eventos
  * 
- * Eventos manejados:
- * - START: Inicio del proceso OTA
- * - CONNECTED: Conexión establecida con el servidor
- * - GET_IMG_DESC: Leyendo descripción del firmware
- * - VERIFY_CHIP_ID: Verificando compatibilidad del chip
- * - WRITE_FLASH: Escribiendo firmware en flash (ocurre múltiples veces)
- * - FINISH: OTA completado exitosamente
- * - ABORT: OTA cancelado o fallido
+ * FASE 4: VALIDACIÓN DE FIRMWARE (si rollback habilitado)
+ *   - Verifica si arrancamos después de una actualización OTA
+ *   - Marca el firmware como válido o invalida para rollback
  * 
- * @param arg Argumento personalizado (no utilizado)
- * @param event_base Base del evento (ESP_HTTPS_OTA_EVENT)
- * @param event_id ID del evento específico
- * @param event_data Datos del evento (varía según el tipo)
- */
-static void ota_event_handler(void* arg, esp_event_base_t event_base,
-                              int32_t event_id, void* event_data)
-{
-    // Verificar que el evento es de tipo OTA
-    if (event_base == ESP_HTTPS_OTA_EVENT) {
-        switch (event_id) {
-            case ESP_HTTPS_OTA_START:
-                // OTA iniciado
-                ESP_LOGI(TAG, "OTA iniciado");
-                ota_flash_write_count = 0;  // Resetear contador de escrituras
-                set_all_leds(BLUE_R, BLUE_G, BLUE_B);  // Azul = OTA en progreso
-                break;
-                
-            case ESP_HTTPS_OTA_CONNECTED:
-                // Conexión establecida con el servidor OTA
-                ESP_LOGI(TAG, "Conectado al servidor OTA");
-                break;
-                
-            case ESP_HTTPS_OTA_GET_IMG_DESC:
-                // Leyendo el descriptor de imagen del firmware
-                ESP_LOGI(TAG, "Leyendo descripción de imagen");
-                break;
-                
-            case ESP_HTTPS_OTA_VERIFY_CHIP_ID:
-                // Verificando que el firmware es para este modelo de chip
-                ESP_LOGI(TAG, "Verificando chip ID: %d", *(esp_chip_id_t *)event_data);
-                break;
-                
-            case ESP_HTTPS_OTA_WRITE_FLASH:
-            {
-                // Escribiendo datos en la memoria flash
-                // Este evento ocurre MUCHAS veces durante la actualización
-                int bytes_written = *(int *)event_data;
-                ESP_LOGD(TAG, "Escribiendo en flash: %d bytes", bytes_written);
-                
-                // Parpadeo para indicar progreso visualmente
-                // Cada 10 escrituras cambia el estado del LED
-                ota_flash_write_count++;
-                if (ota_flash_write_count % 10 == 0) {
-                    // Encender LED azul
-                    set_all_leds(BLUE_R, BLUE_G, BLUE_B);
-                } else if (ota_flash_write_count % 10 == 5) {
-                    // Apagar LED a mitad del ciclo para crear parpadeo visible
-                    led_strip_clear(led_strip);
-                    led_strip_refresh(led_strip);
-                }
-                break;
-            }
-                
-            case ESP_HTTPS_OTA_FINISH:
-                // OTA finalizado exitosamente
-                ESP_LOGI(TAG, "OTA finalizado exitosamente");
-                set_all_leds(GREEN_R, GREEN_G, GREEN_B);  // Verde = éxito
-                vTaskDelay(pdMS_TO_TICKS(2000));  // Mostrar verde 2 segundos
-                break;
-                
-            case ESP_HTTPS_OTA_ABORT:
-                // OTA abortado o fallido
-                ESP_LOGE(TAG, "OTA abortado");
-                set_all_leds(RED_R, RED_G, RED_B);  // Rojo = error
-                break;
-                
-            default:
-                // Evento OTA desconocido (para debug)
-                ESP_LOGW(TAG, "Evento OTA desconocido: %ld", event_id);
-                break;
-        }
-    }
-}
-
-/**
- * @brief Valida el header de la nueva imagen de firmware
+ * FASE 5: CREACIÓN DE TAREAS FreeRTOS
+ *   - Tarea de LEDs: Parpadeo continuo (demostración)
+ *   - Tarea OTA: Actualización automática (opcional)
  * 
- * Esta función realiza varias verificaciones de seguridad:
- * 1. Verifica que la versión sea diferente (evita actualizar con la misma versión)
- * 2. Verifica la versión de seguridad (previene downgrades maliciosos)
- * 3. Compara con el firmware actualmente en ejecución
+ * FLUJO POST app_main():
+ * =====================
+ * 1. app_main() retorna
+ * 2. El scheduler de FreeRTOS comienza
+ * 3. Las tareas creadas se ejecutan según sus prioridades
+ * 4. El sistema queda en ejecución indefinida
  * 
- * @param new_app_info Puntero al descriptor de la nueva aplicación
- * @return ESP_OK si la imagen es válida, ESP_FAIL o ESP_ERR_INVALID_ARG si no
+ * DIAGRAMA DE DEPENDENCIAS:
+ * ========================
  * 
- * @note Esta función es crítica para la seguridad del sistema
- */
-static esp_err_t validate_image_header(esp_app_desc_t *new_app_info)
-{
-    // Verificar que el puntero no sea nulo
-    if (new_app_info == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Obtener información de la partición actualmente en ejecución
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_app_desc_t running_app_info;
-    
-    // Leer la descripción del firmware actual
-    if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
-        ESP_LOGI(TAG, "Versión de firmware actual: %s", running_app_info.version);
-    }
-
-    ESP_LOGI(TAG, "Nueva versión de firmware: %s", new_app_info->version);
-
-#ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
-    // Verificar que la versión sea diferente
-    // Evita desperdiciar tiempo actualizando con la misma versión
-    if (memcmp(new_app_info->version, running_app_info.version, sizeof(new_app_info->version)) == 0) {
-        ESP_LOGW(TAG, "La versión actual es la misma que la nueva. No se continuará la actualización.");
-        return ESP_FAIL;
-    }
-#endif
-
-#ifdef CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
-    // Verificación de anti-rollback (seguridad)
-    // Previene que se instale una versión antigua con vulnerabilidades conocidas
-    const uint32_t hw_sec_version = esp_efuse_read_secure_version();
-    if (new_app_info->secure_version < hw_sec_version) {
-        ESP_LOGW(TAG, "La versión de seguridad del nuevo firmware es menor que la actual");
-        return ESP_FAIL;
-    }
-#endif
-
-    return ESP_OK;
-}
-
-/**
- * @brief Tarea FreeRTOS que ejecuta el proceso completo de actualización OTA
+ *     NVS
+ *      ↓
+ *    LEDs ← (feedback visual para todo)
+ *      ↓
+ *    WiFi → OTA
+ *      ↓     ↓
+ *    Tareas
  * 
- * Esta tarea realiza todo el proceso OTA:
- * 1. Espera un tiempo antes de iniciar
- * 2. Configura la conexión HTTPS al servidor
- * 3. Inicia la descarga del firmware
- * 4. Valida el header del nuevo firmware
- * 5. Descarga e instala el firmware completo
- * 6. Verifica que se recibieron todos los datos
- * 7. Valida la imagen completa
- * 8. Reinicia el dispositivo con el nuevo firmware
+ * NOTAS IMPORTANTES:
+ * =================
+ * - Esta función NO debe contener loops infinitos
+ * - Debe completarse y retornar para que FreeRTOS tome control
+ * - Los bloques try-catch no existen en C (usar ESP_ERROR_CHECK)
+ * - Las tareas creadas se ejecutan en paralelo después del retorno
  * 
- * @param pvParameter Parámetro de la tarea (no utilizado)
+ * @warning NO llamar vTaskDelay() o loops infinitos aquí
+ * @warning Si falla una inicialización, el sistema se detendrá (ESP_ERROR_CHECK)
  * 
- * @note Esta tarea se auto-elimina al finalizar (éxito o error)
- */
-void advanced_ota_task(void *pvParameter)
-{
-    ESP_LOGI(TAG, "Iniciando tarea OTA");
-
-    // Esperar 10 segundos antes de iniciar OTA
-    // Da tiempo para que el sistema se estabilice y se conecte a WiFi
-    vTaskDelay(pdMS_TO_TICKS(10000));
-
-    esp_err_t err;
-    esp_err_t ota_finish_err = ESP_OK;
-    
-    // Configuración del cliente HTTP para la descarga
-    esp_http_client_config_t config = {
-        .url = FIRMWARE_UPGRADE_URL,                // URL del firmware
-        .cert_pem = (char *)server_cert_pem_start,  // Certificado CA para HTTPS
-        .timeout_ms = 5000,                         // Timeout de 5 segundos
-        .keep_alive_enable = true,                  // Mantener conexión viva
-    };
-
-    // Configuración específica de OTA
-    esp_https_ota_config_t ota_config = {
-        .http_config = &config,
-    };
-
-    // Handle para el proceso OTA
-    esp_https_ota_handle_t https_ota_handle = NULL;
-    
-    // ==== FASE 1: Iniciar OTA ====
-    err = esp_https_ota_begin(&ota_config, &https_ota_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ESP HTTPS OTA Begin falló");
-        set_all_leds(RED_R, RED_G, RED_B);
-        vTaskDelete(NULL);  // Eliminar esta tarea
-    }
-
-    // ==== FASE 2: Obtener y validar descriptor de imagen ====
-    esp_app_desc_t app_desc = {};
-    err = esp_https_ota_get_img_desc(https_ota_handle, &app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_get_img_desc falló");
-        goto ota_end;  // Ir a limpieza
-    }
-    
-    // Validar el header del firmware (versión, compatibilidad, etc.)
-    err = validate_image_header(&app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Verificación del header de imagen falló");
-        goto ota_end;
-    }
-
-    // ==== FASE 3: Descargar e instalar firmware ====
-    // Este loop descarga y escribe el firmware en bloques
-    while (1) {
-        err = esp_https_ota_perform(https_ota_handle);
-        
-        // Si retorna algo diferente de "EN PROGRESO", salir del loop
-        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
-            break;
-        }
-        
-        // Log de progreso (debug)
-        const size_t len = esp_https_ota_get_image_len_read(https_ota_handle);
-        ESP_LOGD(TAG, "Bytes de imagen leídos: %d", len);
-    }
-
-    // ==== FASE 4: Verificar y finalizar ====
-    // Verificar que se recibieron TODOS los datos
-    if (esp_https_ota_is_complete_data_received(https_ota_handle) != true) {
-        ESP_LOGE(TAG, "No se recibieron los datos completos.");
-        set_all_leds(RED_R, RED_G, RED_B);
-    } else {
-        // Finalizar el proceso OTA
-        // Esto valida la imagen completa y la marca como booteable
-        ota_finish_err = esp_https_ota_finish(https_ota_handle);
-        
-        if ((err == ESP_OK) && (ota_finish_err == ESP_OK)) {
-            // ¡ÉXITO! OTA completado
-            ESP_LOGI(TAG, "Actualización OTA exitosa. Reiniciando...");
-            set_all_leds(GREEN_R, GREEN_G, GREEN_B);
-            vTaskDelay(pdMS_TO_TICKS(2000));  // Mostrar éxito 2 segundos
-            esp_restart();  // Reiniciar con el nuevo firmware
-        } else {
-            // Error en la finalización
-            if (ota_finish_err == ESP_ERR_OTA_VALIDATE_FAILED) {
-                ESP_LOGE(TAG, "Validación de imagen falló, imagen corrupta");
-            }
-            ESP_LOGE(TAG, "Actualización OTA falló 0x%x", ota_finish_err);
-            set_all_leds(RED_R, RED_G, RED_B);
-            vTaskDelete(NULL);
-        }
-    }
-
-ota_end:
-    // ==== LIMPIEZA EN CASO DE ERROR ====
-    esp_https_ota_abort(https_ota_handle);
-    ESP_LOGE(TAG, "Actualización OTA falló");
-    set_all_leds(RED_R, RED_G, RED_B);
-    vTaskDelete(NULL);  // Eliminar esta tarea
-}
-
-
-// ============================================================================
-// FUNCIÓN PRINCIPAL
-// ============================================================================
-
-/**
- * @brief Punto de entrada principal de la aplicación
- * 
- * Esta función inicializa todos los componentes del sistema:
- * 1. Muestra información del firmware actual
- * 2. Inicializa NVS (necesario para WiFi)
- * 3. Registra manejadores de eventos OTA
- * 4. Conecta a WiFi
- * 5. Valida el firmware actual (si hay rollback habilitado)
- * 6. Crea las tareas de FreeRTOS
- * 
- * @note Esta función se ejecuta automáticamente al iniciar el ESP32
- * @note Después de crear las tareas, esta función retorna y el scheduler
- *       de FreeRTOS toma el control
+ * @note Esta función se ejecuta en el contexto de la tarea "main"
+ *       que tiene prioridad 1 y stack de 3584 bytes por defecto
  */
 void app_main(void)
 {
     // ========================================================================
-    // BANNER DE INICIO
+    // FASE 1: BANNER DE INICIO Y DIAGNÓSTICO
     // ========================================================================
-    ESP_LOGI(TAG, "=== Iniciando aplicación LED con OTA ===");
-
-    // ========================================================================
-    // OBTENER Y MOSTRAR INFORMACIÓN DEL FIRMWARE ACTUAL
-    // ========================================================================
-    // Esto es útil para debugging y para saber qué versión está corriendo
     
-    // Obtener la partición que está actualmente en ejecución
+    // Banner visual en el monitor serial
+    // Ayuda a identificar reinicios del sistema en los logs
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   INICIANDO APLICACIÓN LED STRIP CON OTA              ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════╝");
+
+    // ------------------------------------------------------------------------
+    // OBTENER INFORMACIÓN DEL FIRMWARE ACTUAL
+    // ------------------------------------------------------------------------
+    
+    /**
+     * PROPÓSITO DE MOSTRAR VERSIÓN:
+     * - Debugging: Saber qué versión está ejecutándose
+     * - Trazabilidad: Relacionar comportamiento con versión específica
+     * - Validación OTA: Confirmar que la actualización fue exitosa
+     * - Soporte: Los usuarios pueden reportar la versión exacta
+     */
+    
+    // Obtener puntero a la partición que está actualmente ejecutándose
+    // El ESP32 tiene múltiples particiones: ota_0, ota_1, factory, etc.
     const esp_partition_t *running = esp_ota_get_running_partition();
+    
+    // Estructura que almacenará la descripción de la aplicación
+    // Contiene: versión, nombre del proyecto, fecha, hora, IDF version, etc.
     esp_app_desc_t running_app_info;
     
-    // Leer la descripción de la aplicación desde la partición
+    // Leer la descripción desde la partición actual
+    // Esta información está embebida en el .bin durante la compilación
     if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
+        
         // Mostrar versión del firmware
-        // La versión se define en el archivo project_description.txt o CMakeLists.txt
-        ESP_LOGI(TAG, "Versión actual: %s", running_app_info.version);
+        // La versión se define en:
+        // - project_description.txt, O
+        // - CMakeLists.txt con set(PROJECT_VER "x.y.z")
+        ESP_LOGI(TAG, "📌 Versión actual: %s", running_app_info.version);
         
         // Mostrar fecha y hora de compilación
-        // Útil para identificar exactamente cuándo se compiló este firmware
-        ESP_LOGI(TAG, "Fecha de compilación: %s %s", 
-                 running_app_info.date, running_app_info.time);
+        // Formato: "MMM DD YYYY" "HH:MM:SS"
+        // Ejemplo: "Feb 08 2025" "14:30:45"
+        // ÚTIL: Diferencia builds hechos el mismo día
+        ESP_LOGI(TAG, "🕐 Compilado: %s %s", 
+                 running_app_info.date,      // __DATE__ del compilador
+                 running_app_info.time);     // __TIME__ del compilador
+        
+        // INFORMACIÓN ADICIONAL DISPONIBLE (pero no mostrada):
+        // - running_app_info.project_name
+        // - running_app_info.idf_ver (versión de ESP-IDF)
+        // - running_app_info.secure_version (para anti-rollback)
+        
+    } else {
+        // Si falla, probablemente la partición está corrupta
+        // Esto NO debería ocurrir nunca en condiciones normales
+        ESP_LOGW(TAG, "⚠️  No se pudo leer la descripción del firmware");
     }
 
     // ========================================================================
-    // INICIALIZAR NVS (Non-Volatile Storage)
+    // FASE 2: INICIALIZACIÓN DE NVS (Non-Volatile Storage)
     // ========================================================================
-    // NVS es necesario para:
-    // - Almacenar configuración WiFi
-    // - Guardar datos de calibración PHY
-    // - Otros datos persistentes del sistema
     
+    /**
+     * ¿QUÉ ES NVS?
+     * ===========
+     * NVS (Non-Volatile Storage) es un sistema de almacenamiento clave-valor
+     * en la memoria flash del ESP32. Es como una pequeña base de datos
+     * que persiste después de reinicios y pérdidas de energía.
+     * 
+     * ¿PARA QUÉ SE USA?
+     * ================
+     * - WiFi: Guardar credenciales y configuración
+     * - PHY: Datos de calibración de radio
+     * - Bluetooth: Configuración y emparejamientos
+     * - Aplicación: Cualquier dato que deba persistir
+     * 
+     * EJEMPLOS DE USO:
+     * ===============
+     * nvs_set_str(handle, "wifi_ssid", "MiRed");
+     * nvs_set_i32(handle, "led_brightness", 128);
+     * nvs_get_str(handle, "wifi_ssid", buffer, &length);
+     * 
+     * ESTRUCTURA EN FLASH:
+     * ===================
+     * La flash tiene una partición "nvs" definida en partitions.csv
+     * Típicamente: nvs, data, 0x9000, 0x6000
+     */
+    
+    ESP_LOGI(TAG, "Inicializando NVS...");
+    
+    // Intentar inicializar NVS
     esp_err_t ret = nvs_flash_init();
     
-    // Verificar si NVS necesita ser borrado
-    // Esto puede ocurrir si:
-    // - No hay espacio libre en NVS
-    // - Se detecta una nueva versión del formato NVS
+    // ------------------------------------------------------------------------
+    // MANEJO DE ERRORES COMUNES DE NVS
+    // ------------------------------------------------------------------------
+    
+    /**
+     * ERROR 1: ESP_ERR_NVS_NO_FREE_PAGES
+     * ==================================
+     * Causa: La partición NVS está llena
+     * Solución: Borrar NVS y reinicializar
+     * Consecuencia: Se pierden todos los datos guardados
+     * 
+     * ERROR 2: ESP_ERR_NVS_NEW_VERSION_FOUND
+     * ======================================
+     * Causa: El formato de NVS cambió entre versiones de ESP-IDF
+     * Solución: Borrar NVS con el formato antiguo
+     * Consecuencia: Se pierden datos, pero es necesario para compatibilidad
+     */
+    
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        // Borrar NVS y reintentar inicialización
-        ESP_LOGI(TAG, "Borrando NVS debido a: %s", 
-                 ret == ESP_ERR_NVS_NO_FREE_PAGES ? "sin espacio" : "nueva versión");
+        
+        // Log explicativo del problema
+        ESP_LOGW(TAG, "⚠️  NVS requiere borrado: %s", 
+                 ret == ESP_ERR_NVS_NO_FREE_PAGES ? 
+                 "Sin espacio libre" : 
+                 "Nueva versión detectada");
+        
+        // Borrar completamente la partición NVS
+        // ADVERTENCIA: Esto elimina:
+        // - Credenciales WiFi guardadas
+        // - Configuraciones de aplicación
+        // - Datos de calibración (se recalibrarán)
         ESP_ERROR_CHECK(nvs_flash_erase());
+        
+        // Reintentar inicialización después del borrado
         ret = nvs_flash_init();
+        
+        ESP_LOGI(TAG, "✓ NVS reinicializado exitosamente");
     }
     
     // Verificar que NVS se inicializó correctamente
-    // Si falla aquí, el programa se detiene (ESP_ERROR_CHECK)
+    // Si falla aquí, el dispositivo se detendrá (ESP_ERROR_CHECK)
+    // Posibles causas de fallo:
+    // - Hardware defectuoso (flash corrupta)
+    // - Partición NVS mal configurada en partitions.csv
+    // - Problema grave del sistema
     ESP_ERROR_CHECK(ret);
-
-	// ========================================================================
-	// *** IMPORTANTE: INICIALIZAR LEDs ANTES DE WIFI ***
-	// ========================================================================
-	ESP_LOGI(TAG, "Inicializando tira LED...");
-	configure_led();
-	ESP_LOGI(TAG, "LEDs inicializados correctamente");
-
+    
+    ESP_LOGI(TAG, "✓ NVS inicializado correctamente");
 
     // ========================================================================
-    // INICIALIZAR Y CONECTAR WIFI
+    // FASE 3: INICIALIZACIÓN DE PERIFÉRICOS Y CONECTIVIDAD
     // ========================================================================
-    // Esta función es bloqueante y esperará hasta que:
-    // - Se obtenga una dirección IP exitosamente, o
-    // - Se agoten los reintentos de conexión
-   
+    
+    // ------------------------------------------------------------------------
+    // SUBSISTEMA 1: CONTROL DE LEDs
+    // ------------------------------------------------------------------------
+    
+    /**
+     * ¿POR QUÉ INICIALIZAR LEDs PRIMERO?
+     * ==================================
+     * Los LEDs proporcionan retroalimentación visual inmediata sobre el
+     * estado del sistema. Todos los demás módulos (WiFi, OTA) usan los
+     * LEDs para indicar su estado, por lo que DEBEN estar listos primero.
+     * 
+     * CÓDIGO DE COLORES (definidos en led_control.h):
+     * - 🟠 Naranja: Conectando/Reconectando WiFi
+     * - 🔴 Rojo:    Error (WiFi, OTA, etc)
+     * - 🟢 Verde:   Operación exitosa
+     * - 🔵 Azul:    Proceso OTA en curso
+     * 
+     * DEPENDENCIAS:
+     * - GPIO (automático en ESP-IDF)
+     * - RMT peripheral (para protocolo WS2812B)
+     */
+    
+    ESP_LOGI(TAG, "Inicializando control de LEDs...");
+    
+    // Llamar a la función de inicialización del módulo LED
+    // Esta función:
+    // 1. Configura el periférico RMT
+    // 2. Asocia el GPIO configurado
+    // 3. Inicializa el driver led_strip
+    // 4. Apaga todos los LEDs (estado limpio)
+    led_control_init();
+    
+    ESP_LOGI(TAG, "✓ LEDs inicializados (GPIO %d)", CONFIG_BLINK_GPIO);
+    
+    // NOTA: En este punto los LEDs están apagados
+    // Los módulos siguientes (WiFi, OTA) los controlarán según necesiten
+
+    // ------------------------------------------------------------------------
+    // SUBSISTEMA 2: CONECTIVIDAD WiFi
+    // ------------------------------------------------------------------------
+    
+    /**
+     * ORDEN DE INICIALIZACIÓN:
+     * =======================
+     * WiFi DEBE inicializarse DESPUÉS de:
+     * - NVS (usa NVS para guardar configuración)
+     * - LEDs (usa LEDs para feedback visual)
+     * 
+     * COMPORTAMIENTO:
+     * ==============
+     * wifi_init_sta() es una función BLOQUEANTE
+     * No retorna hasta que:
+     * - WiFi se conecta exitosamente (obtiene IP), O
+     * - Falla después de MAXIMUM_RETRY intentos
+     * 
+     * DURANTE LA CONEXIÓN:
+     * ===================
+     * - LEDs naranjas: Intentando conectar
+     * - LEDs rojos: Falló completamente
+     * - LEDs verdes: Conectado exitosamente
+     * 
+     * CONFIGURACIÓN:
+     * =============
+     * SSID y Password se configuran en menuconfig:
+     * Component config → WiFi Config
+     */
+    
     ESP_LOGI(TAG, "Iniciando conexión WiFi...");
+    ESP_LOGI(TAG, "SSID objetivo: %s", CONFIG_WIFI_SSID);
+    
+    // Inicializar y conectar WiFi (BLOQUEANTE)
+    // El programa se detiene aquí hasta que WiFi se conecte
     wifi_init_sta();
-    ESP_LOGI(TAG, "WiFi inicializado y conectado");
-	
-	// ========================================================================
-	// REGISTRAR MANEJADOR DE EVENTOS OTA
-	// ========================================================================
-	// Este handler recibirá notificaciones de todos los eventos OTA
-	// y proporcionará retroalimentación visual mediante los LEDs
-
-	ESP_ERROR_CHECK(esp_event_handler_register(
-	    ESP_HTTPS_OTA_EVENT,      // Base de eventos OTA
-	    ESP_EVENT_ANY_ID,         // Registrar para TODOS los eventos OTA
-	    &ota_event_handler,       // Función callback
-	    NULL                      // Sin argumentos personalizados
-	));
-
-	ESP_LOGI(TAG, "Manejador de eventos OTA registrado");
-	
-    // ========================================================================
-    // MANEJO DE ROLLBACK (solo si está habilitado en menuconfig)
-    // ========================================================================
-    // El rollback permite revertir automáticamente a la versión anterior
-    // si el nuevo firmware no se valida correctamente
     
-#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
+    // Si llegamos aquí, WiFi está conectado y con IP asignada
+    ESP_LOGI(TAG, "✓ WiFi conectado exitosamente");
     
-    // Verificar el estado de la imagen OTA actual
+    // IMPORTANTE: A partir de aquí, el sistema tiene conectividad
+    // Ya podemos usar HTTP, MQTT, NTP, OTA, etc.
+
+    // ------------------------------------------------------------------------
+    // SUBSISTEMA 3: SISTEMA OTA
+    // ------------------------------------------------------------------------
+    
+    /**
+     * INICIALIZACIÓN OTA:
+     * ==================
+     * ota_init() registra los manejadores de eventos OTA
+     * NO inicia una actualización, solo prepara el sistema
+     * 
+     * EVENTOS MANEJADOS:
+     * - START: OTA comenzó
+     * - CONNECTED: Conectado al servidor
+     * - WRITE_FLASH: Escribiendo firmware (parpadeo LED)
+     * - FINISH: OTA completado
+     * - ABORT: OTA cancelado/fallido
+     * 
+     * INDICADORES VISUALES:
+     * - LEDs azules parpadeando: Descargando/escribiendo
+     * - LEDs verdes: OTA exitoso
+     * - LEDs rojos: OTA fallido
+     */
+    
+    ESP_LOGI(TAG, "Inicializando sistema OTA...");
+    
+    // Registrar manejadores de eventos OTA
+    // Esto NO inicia una actualización, solo prepara el sistema
+    ota_init();
+    
+    ESP_LOGI(TAG, "✓ Sistema OTA listo");
+
+    // ========================================================================
+    // FASE 4: VALIDACIÓN DE FIRMWARE (ROLLBACK SUPPORT)
+    // ========================================================================
+    
+    /**
+     * ¿QUÉ ES ROLLBACK?
+     * =================
+     * El rollback es un mecanismo de seguridad que permite volver
+     * automáticamente a la versión anterior del firmware si la nueva
+     * versión no funciona correctamente.
+     * 
+     * ¿CÓMO FUNCIONA?
+     * ==============
+     * 1. OTA descarga nuevo firmware a partición inactiva (ota_1)
+     * 2. Marca la nueva partición como "pendiente de verificación"
+     * 3. Reinicia el ESP32
+     * 4. Bootloader arranca desde la nueva partición
+     * 5. Si app_main() llega hasta aquí y marca como válido → OK
+     * 6. Si el ESP32 se reinicia antes de marcar válido → ROLLBACK
+     * 
+     * ESTADOS DE PARTICIÓN OTA:
+     * ========================
+     * - ESP_OTA_IMG_NEW: Recién instalada, no arrancada aún
+     * - ESP_OTA_IMG_PENDING_VERIFY: Primera ejecución, pendiente validación
+     * - ESP_OTA_IMG_VALID: Validada, OK para usar
+     * - ESP_OTA_IMG_INVALID: Marcada como mala, no arrancar
+     * - ESP_OTA_IMG_ABORTED: OTA cancelado
+     * - ESP_OTA_IMG_UNDEFINED: Estado desconocido
+     * 
+     * ¿CUÁNDO OCURRE ROLLBACK?
+     * ========================
+     * - Firmware crashea antes de marcar como válido
+     * - Watchdog timer resetea el sistema
+     * - Panic/Exception no manejada
+     * - Usuario presiona RESET antes de validación
+     * 
+     * CONFIGURACIÓN:
+     * =============
+     * Se habilita en menuconfig:
+     * Bootloader config → App rollback support
+     */
+    
+    // Esta característica solo está disponible si se configuró en menuconfig
+    #if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
+    
+    ESP_LOGI(TAG, "Verificando estado de firmware (rollback habilitado)...");
+    
+    // Variable para almacenar el estado de la imagen OTA
     esp_ota_img_states_t ota_state;
     
+    // Obtener el estado de la partición actual
+    // running = partición desde la que estamos ejecutando
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         
-        // Si la imagen está pendiente de verificación, significa que:
-        // 1. Acabamos de actualizar a esta versión mediante OTA
-        // 2. Es la primera vez que arranca
-        // 3. Necesitamos confirmar que funciona correctamente
+        // ----------------------------------------------------------------
+        // CASO 1: PRIMERA EJECUCIÓN DESPUÉS DE OTA
+        // ----------------------------------------------------------------
+        
+        /**
+         * Estado PENDING_VERIFY indica:
+         * - Acabamos de actualizar mediante OTA
+         * - Es la primera vez que arranca esta versión
+         * - El bootloader está esperando confirmación
+         * - Si no confirmamos, habrá rollback en el próximo reinicio
+         */
         
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
             
-            // Marcar la aplicación como válida
-            // Esto previene que el bootloader haga rollback automático
-            // en el siguiente reinicio
+            ESP_LOGI(TAG, "🔄 Detectada primera ejecución post-OTA");
+            ESP_LOGI(TAG, "   Validando nuevo firmware...");
+            
+            /**
+             * MARCAR FIRMWARE COMO VÁLIDO:
+             * ===========================
+             * Esta llamada es CRÍTICA. Le dice al bootloader:
+             * "Este firmware funciona bien, no hagas rollback"
+             * 
+             * CUÁNDO LLAMAR:
+             * - Después de verificar que todo funciona
+             * - Una vez que el sistema está estable
+             * - Típicamente en app_main() después de inicializaciones
+             * 
+             * SI NO SE LLAMA:
+             * - El bootloader cuenta los reinicios
+             * - Después de N reinicios sin validar → ROLLBACK automático
+             * - El sistema vuelve a la versión anterior
+             * 
+             * ESTRATEGIAS AVANZADAS:
+             * - Validar después de X minutos de uptime
+             * - Validar después de test funcional completo
+             * - Validar después de conectividad comprobada
+             */
             
             if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-                ESP_LOGI(TAG, "App válida, rollback cancelado exitosamente");
                 
-                // En este punto, el firmware se considera estable
-                // Si el dispositivo se reinicia ahora, arrancará con esta versión
+                // ¡ÉXITO! Firmware validado
+                ESP_LOGI(TAG, "✅ Firmware validado exitosamente");
+                ESP_LOGI(TAG, "   Rollback cancelado, esta versión es estable");
+                
+                // OPCIONAL: Aquí podrías:
+                // - Enviar telemetría de actualización exitosa
+                // - Actualizar contador de versión en NVS
+                // - Notificar al servidor que la actualización funcionó
+                // - Guardar timestamp de última actualización
                 
             } else {
-                ESP_LOGE(TAG, "Fallo al cancelar rollback");
+                // Error al marcar como válido
+                // Esto es GRAVE y poco común
+                ESP_LOGE(TAG, "❌ ERROR: No se pudo validar el firmware");
+                ESP_LOGE(TAG, "   Posible rollback en próximo reinicio");
                 
-                // Si falla al marcar como válida, podría haber rollback
-                // en el próximo reinicio
+                // POSIBLES CAUSAS:
+                // - Partición OTA corrupta
+                // - Flash defectuosa
+                // - Error interno del bootloader
+                
+                // ACCIÓN RECOMENDADA:
+                // - Log del error para debugging
+                // - Considerar reinicio forzado para intentar rollback
+                // - Notificar al servidor del problema
             }
-        } else {
-            // Estados posibles:
-            // - ESP_OTA_IMG_VALID: Imagen ya validada previamente
-            // - ESP_OTA_IMG_INVALID: Imagen marcada como inválida
-            // - ESP_OTA_IMG_ABORTED: OTA fue abortado
-            // - ESP_OTA_IMG_UNDEFINED: Estado no definido
             
-            ESP_LOGI(TAG, "Estado de imagen OTA: %d", ota_state);
+        // ----------------------------------------------------------------
+        // CASO 2: FIRMWARE YA VALIDADO PREVIAMENTE
+        // ----------------------------------------------------------------
+        
+        } else if (ota_state == ESP_OTA_IMG_VALID) {
+            
+            // Este es el caso normal en ejecuciones posteriores
+            // El firmware ya fue validado en un arranque anterior
+            ESP_LOGI(TAG, "✓ Firmware previamente validado, estado: VÁLIDO");
+            
+        // ----------------------------------------------------------------
+        // CASO 3: OTROS ESTADOS
+        // ----------------------------------------------------------------
+        
+        } else {
+            
+            // Estados menos comunes
+            // Pueden indicar problemas o situaciones especiales
+            ESP_LOGW(TAG, "⚠️  Estado de imagen OTA: %d", ota_state);
+            
+            // Interpretación de estados:
+            switch (ota_state) {
+                case ESP_OTA_IMG_NEW:
+                    ESP_LOGW(TAG, "   NEW: Imagen nueva sin arrancar");
+                    break;
+                case ESP_OTA_IMG_INVALID:
+                    ESP_LOGW(TAG, "   INVALID: Imagen marcada como inválida");
+                    break;
+                case ESP_OTA_IMG_ABORTED:
+                    ESP_LOGW(TAG, "   ABORTED: OTA fue abortado");
+                    break;
+                case ESP_OTA_IMG_UNDEFINED:
+                    ESP_LOGW(TAG, "   UNDEFINED: Estado no definido");
+                    break;
+                default:
+                    ESP_LOGW(TAG, "   Desconocido");
+            }
         }
+        
+    } else {
+        // No se pudo leer el estado - error poco común
+        ESP_LOGW(TAG, "⚠️  No se pudo determinar estado de la imagen OTA");
     }
     
-#endif // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    #else
+    
+    // Rollback NO está habilitado en la configuración
+    // El código de validación no se compila
+    ESP_LOGI(TAG, "ℹ️  Rollback deshabilitado en configuración");
+    
+    #endif // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
 
     // ========================================================================
-    // CREAR TAREAS DE FREERTOS
+    // FASE 5: CREACIÓN DE TAREAS FreeRTOS
     // ========================================================================
     
-    // ---- TAREA DE CONTROL DE LEDS ----
-    // Esta tarea maneja la secuencia de parpadeo demostrativa
-    // Normalmente se comenta en producción para que los LEDs solo
-    // muestren estados del sistema (WiFi, OTA, etc.)
+    /**
+     * SISTEMA MULTITAREA:
+     * ==================
+     * FreeRTOS permite ejecutar múltiples tareas concurrentemente.
+     * Cada tarea es como un "mini-programa" que se ejecuta en paralelo.
+     * 
+     * SCHEDULER DE FreeRTOS:
+     * =====================
+     * - Prioridades: 0 (menor) a 24 (mayor)
+     * - Preemptive: Una tarea de mayor prioridad interrumpe a una de menor
+     * - Round-robin: Tareas de igual prioridad se turnan
+     * - Tick: El scheduler cambia de contexto cada tick (típicamente 1ms)
+     * 
+     * STACK SIZE:
+     * ==========
+     * Cada tarea tiene su propio stack. Si es muy pequeño → STACK OVERFLOW
+     * Si es muy grande → Desperdicio de RAM
+     * Típicos: 2048-4096 bytes para tareas simples
+     *          8192+ bytes para tareas con HTTP, SSL, etc.
+     * 
+     * ANATOMÍA DE UNA TAREA:
+     * =====================
+     * void mi_tarea(void *parametro) {
+     *     // Inicialización
+     *     while(1) {
+     *         // Trabajo de la tarea
+     *         vTaskDelay(pdMS_TO_TICKS(100)); // Ceder control
+     *     }
+     *     // NUNCA llegar aquí
+     *     vTaskDelete(NULL); // Si la tarea termina
+     * }
+     */
     
-    ESP_LOGI(TAG, "Creando tarea de control de LEDs");
+    ESP_LOGI(TAG, "Creando tareas FreeRTOS...");
+
+    // ------------------------------------------------------------------------
+    // TAREA 1: CONTROL DE LEDs (DEMOSTRACIÓN)
+    // ------------------------------------------------------------------------
+    
+    /**
+     * PROPÓSITO:
+     * - Mostrar secuencia de colores continua
+     * - Verificar que el sistema está funcionando
+     * - Demo visual para testing
+     * 
+     * PRODUCCIÓN:
+     * En una aplicación real, probablemente:
+     * - Comentarías esta tarea
+     * - Los LEDs solo mostrarían estados del sistema
+     * - O los controlarías bajo demanda (eventos, comandos)
+     */
+    
+    ESP_LOGI(TAG, "  → Tarea LED_STRIP (parpadeo continuo)");
+    
     xTaskCreate(
-        led_strip_task,     // Función de la tarea
-        "LED_STRIP",        // Nombre descriptivo (para debugging)
-        4096,               // Tamaño del stack en bytes
-        NULL,               // Parámetro pasado a la tarea
-        3,                  // Prioridad (0-24, mayor = más prioritaria)
-        NULL                // Handle de la tarea (no lo necesitamos)
+        led_task,               // Función de la tarea (en led_control.c)
+        "LED_STRIP",            // Nombre descriptivo (para debugging)
+                                // Visible en: "uxTaskGetSystemState()"
+        4096,                   // Tamaño del stack en bytes
+                                // 4KB es suficiente para esta tarea simple
+        NULL,                   // Parámetro pasado a la tarea (void *pvParameter)
+                                // NULL = sin parámetros
+        3,                      // Prioridad (0-24)
+                                // 3 = Media-baja, no crítica
+        NULL                    // Handle de la tarea (TaskHandle_t *)
+                                // NULL = no necesitamos referencia
     );
-
-    // ---- TAREA OTA (OPCIONAL) ----
-    // Esta tarea ejecuta el proceso de actualización OTA
-    // 
-    // IMPORTANTE: Descomentar esta línea solo cuando:
-    // - Tienes un servidor con el firmware disponible
-    // - La URL está correctamente configurada
-    // - Quieres actualización automática al inicio
-    //
-    // Alternativamente, puedes:
-    // - Crear esta tarea bajo demanda (botón, comando, etc.)
-    // - Ejecutarla en intervalos periódicos
-    // - Dispararla mediante MQTT, HTTP, etc.
     
+    /**
+     * ALTERNATIVAS DE USO:
+     * ===================
+     * TaskHandle_t led_handle;
+     * xTaskCreate(led_task, "LED", 4096, NULL, 3, &led_handle);
+     * // Ahora puedes:
+     * vTaskSuspend(led_handle);    // Pausar la tarea
+     * vTaskResume(led_handle);     // Reanudar la tarea
+     * vTaskDelete(led_handle);     // Eliminar la tarea
+     */
+
+    // ------------------------------------------------------------------------
+    // TAREA 2: ACTUALIZACIÓN OTA (OPCIONAL - COMENTADA)
+    // ------------------------------------------------------------------------
+    
+    /**
+     * TAREA OTA:
+     * =========
+     * Esta tarea ejecuta el proceso completo de actualización OTA:
+     * 1. Espera 10 segundos (dar tiempo al sistema a estabilizarse)
+     * 2. Se conecta al servidor HTTPS
+     * 3. Descarga el nuevo firmware
+     * 4. Valida la imagen
+     * 5. Escribe en la partición OTA inactiva
+     * 6. Reinicia el ESP32 con el nuevo firmware
+     * 
+     * ¿POR QUÉ ESTÁ COMENTADA?
+     * ========================
+     * - Actualización automática puede no ser deseada
+     * - Requiere servidor configurado con firmware
+     * - URL debe estar correctamente configurada
+     * - Consume ancho de banda en cada arranque
+     * 
+     * CUÁNDO DESCOMENTAR:
+     * ==================
+     * - Cuando tengas un servidor con firmware .bin
+     * - URL configurada en menuconfig o código
+     * - Certificado CA correcto (para HTTPS)
+     * - Quieras actualización al arranque
+     * 
+     * ALTERNATIVAS DE ACTIVACIÓN:
+     * ==========================
+     * En lugar de auto-iniciar, puedes activar OTA mediante:
+     * - Botón físico presionado al arrancar
+     * - Comando recibido por MQTT
+     * - Petición HTTP a un servidor embebido
+     * - Timer periódico (verificar actualizaciones cada N horas)
+     * - Condición específica (ej: si versión < X.Y.Z)
+     * 
+     * EJEMPLO DE ACTIVACIÓN POR BOTÓN:
+     * ================================
+     * if (gpio_get_level(BUTTON_GPIO) == 0) {
+     *     ESP_LOGI(TAG, "Botón presionado, iniciando OTA");
+     *     xTaskCreate(ota_task, "OTA", 8192, NULL, 5, NULL);
+     * }
+     */
+    
+    // DESCOMENTAR PARA HABILITAR OTA AUTOMÁTICO AL ARRANQUE:
+    // 
+    // ESP_LOGI(TAG, "  → Tarea OTA (actualización automática)");
     // xTaskCreate(
-    //     &advanced_ota_task, // Función de la tarea OTA
+    //     ota_task,           // Función de la tarea (en ota_manager.c)
     //     "OTA_Task",         // Nombre descriptivo
     //     1024 * 8,           // 8KB de stack (OTA necesita más memoria)
+    //                         // Razón: HTTP client, SSL, buffers grandes
     //     NULL,               // Sin parámetros
-    //     5,                  // Prioridad alta para OTA
+    //     5,                  // Prioridad ALTA (5)
+    //                         // Razón: OTA es crítico, queremos que termine rápido
     //     NULL                // Sin handle
     // );
+    //
+    // NOTA: La tarea OTA se auto-elimina al terminar (éxito o fallo)
+    // mediante vTaskDelete(NULL) en ota_manager.c
     
-    // NOTA: Si descomentas la tarea OTA, se ejecutará automáticamente
-    // después de 10 segundos (ver advanced_ota_task)
+    ESP_LOGI(TAG, "  ℹ️  Tarea OTA deshabilitada (descomentar para activar)");
 
     // ========================================================================
-    // SISTEMA INICIADO
+    // FASE 6: SISTEMA COMPLETAMENTE INICIALIZADO
     // ========================================================================
-    ESP_LOGI(TAG, "=== Sistema iniciado correctamente ===");
     
-    // A partir de aquí, app_main() retorna y el scheduler de FreeRTOS
-    // toma el control, ejecutando las tareas creadas según sus prioridades
+    /**
+     * ESTADO DEL SISTEMA EN ESTE PUNTO:
+     * =================================
+     * ✅ NVS inicializado y funcional
+     * ✅ LEDs configurados y listos
+     * ✅ WiFi conectado con IP asignada
+     * ✅ OTA preparado (manejadores registrados)
+     * ✅ Firmware validado (si había actualización)
+     * ✅ Tareas FreeRTOS creadas y listas
+     * 
+     * QUÉ SUCEDE DESPUÉS:
+     * ==================
+     * 1. app_main() RETORNA
+     * 2. La tarea "main" se elimina automáticamente
+     * 3. El scheduler de FreeRTOS toma control total
+     * 4. Las tareas creadas comienzan a ejecutarse:
+     *    - led_task: Parpadea LEDs continuamente
+     *    - (ota_task: Si está descomentada)
+     *    - Tareas internas de ESP-IDF (WiFi, TCP/IP, etc)
+     * 
+     * TAREAS DEL SISTEMA (automáticas):
+     * =================================
+     * Además de nuestras tareas, FreeRTOS ejecuta:
+     * - IDLE task (prioridad 0): Se ejecuta cuando ninguna tarea está activa
+     * - Timer task: Gestiona timers software
+     * - WiFi task: Maneja eventos WiFi internos
+     * - LWIP task: Stack TCP/IP
+     * - Event task: Procesa eventos del sistema
+     * 
+     * MONITOREO:
+     * =========
+     * Para ver todas las tareas en ejecución:
+     * TaskStatus_t tasks[10];
+     * UBaseType_t count = uxTaskGetSystemState(tasks, 10, NULL);
+     * 
+     * O simplemente mira los logs con 'idf.py monitor'
+     */
     
-    // Las tareas ejecutándose son:
-    // 1. led_strip_task - Parpadeo de LEDs
-    // 2. Tareas internas de WiFi y TCP/IP
-    // 3. Tareas del sistema FreeRTOS (idle, timer, etc.)
-    // 4. advanced_ota_task (si está descomentada)
+    // Banner de sistema listo
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   ✅ SISTEMA INICIADO CORRECTAMENTE                   ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Estado del sistema:");
+    ESP_LOGI(TAG, "  • LEDs:     ✓ Operativos");
+    ESP_LOGI(TAG, "  • WiFi:     ✓ Conectado (%s)", CONFIG_WIFI_SSID);
+    ESP_LOGI(TAG, "  • OTA:      ✓ Listo");
+    ESP_LOGI(TAG, "  • Tareas:   ✓ Ejecutándose");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "El sistema está operativo y ejecutando tareas...");
     
-    // FLUJO TÍPICO:
-    // 1. Sistema arranca
-    // 2. app_main() se ejecuta
-    // 3. Se inicializa NVS, WiFi, etc.
-    // 4. Se crean las tareas
-    // 5. app_main() retorna
-    // 6. Las tareas siguen ejecutándose indefinidamente
-    // 7. Los LEDs parpadean continuamente
-    // 8. El sistema queda esperando eventos (WiFi, OTA, etc.)
-	
+    /**
+     * DEBUGGING:
+     * =========
+     * Si necesitas debug, añade aquí:
+     * 
+     * // Mostrar memoria libre
+     * ESP_LOGI(TAG, "RAM libre: %d bytes", esp_get_free_heap_size());
+     * 
+     * // Mostrar número de tareas
+     * ESP_LOGI(TAG, "Tareas activas: %d", uxTaskGetNumberOfTasks());
+     * 
+     * // Mostrar uptime
+     * ESP_LOGI(TAG, "Uptime: %lld ms", esp_timer_get_time() / 1000);
+     */
+    
+    // ========================================================================
+    // FIN DE app_main()
+    // ========================================================================
+    
+    /**
+     * IMPORTANTE:
+     * ==========
+     * - NO añadir loops infinitos aquí (while(1))
+     * - NO añadir vTaskDelay() aquí
+     * - app_main() DEBE retornar para que FreeRTOS funcione
+     * 
+     * A partir de aquí:
+     * - El scheduler de FreeRTOS controla la ejecución
+     * - Las tareas se ejecutan concurrentemente
+     * - El sistema continúa indefinidamente
+     * - Solo se detiene por: reinicio, panic, o apagado
+     * 
+     * PRÓXIMOS PASOS:
+     * ==============
+     * 1. Compilar: idf.py build
+     * 2. Flashear: idf.py flash
+     * 3. Monitorear: idf.py monitor
+     * 4. Observar: Los LEDs parpadearán en secuencia
+     * 5. (Opcional) Descomentar tarea OTA para actualización automática
+     */
+    
+    // La función retorna, FreeRTOS toma control
+    // ¡El sistema está vivo! 🚀
 }
 
 // ============================================================================
-// FIN DEL CÓDIGO
+// FIN DEL ARCHIVO
 // ============================================================================

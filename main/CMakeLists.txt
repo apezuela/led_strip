@@ -1,5 +1,8 @@
 idf_component_register(
     SRCS "led_strip_custom.c"
+         "led_control.c"
+         "ota_manager.c"
+         "wifi_manager.c"
     PRIV_REQUIRES esp_http_client app_update esp_https_ota
                   nvs_flash esp_netif esp_wifi efuse bt
                   protocomm
