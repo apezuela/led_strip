@@ -3,6 +3,15 @@
 server_certs/
 managed_components/
 dependencies/
+./settings
+build/*
+!build/*.bin
+!build/*.elf
+
+# Archivos adicionales de build
+sdkconfig.old
+*.map
+
 
 
 # ESP-IDF config
